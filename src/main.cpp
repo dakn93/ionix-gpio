@@ -5,9 +5,11 @@
  */
 #include <Arduino.h>
 #include <DNSServer.h>
+#include <HTTPClient.h>
 #include <Preferences.h>
 #include <WebServer.h>
 #include <WiFi.h>
+#include <WiFiClientSecure.h>
 #include <ESPmDNS.h>
 #include <Update.h>
 #include <cstdlib>
@@ -22,7 +24,7 @@
 #include <pins.h>
 
 #ifndef IONIX_FW_VERSION
-#define IONIX_FW_VERSION "0.1.0"
+#define IONIX_FW_VERSION "0.1.1"
 #endif
 
 namespace {
@@ -86,6 +88,7 @@ constexpr const char *kHotspotPass = "ionixpass";
 void applyUserChannelsToRuntime();
 bool parseIpv4(const String &s, IPAddress &out);
 IPAddress guessGatewayFromIp(const IPAddress &ip);
+String apSsid();
 static bool bringUpSoftAp();
 
 #if defined(USE_ETHERNET_PORT)
@@ -122,28 +125,44 @@ void beginEthernetDhcp() {
 
 String apIpStr() { return WiFi.softAPIP().toString(); }
 
-String mdnsHostname() {
-#if defined(USE_ETHERNET_PORT)
-  String mac = ETH.macAddress();
-#else
-  String mac = WiFi.macAddress();
-#endif
-  mac.replace(":", "");
-  mac.toLowerCase();
-  String last4 = mac.substring(mac.length() - 4);
-  String host = "ionix-gpio-" + last4;
-  if (g_deviceName.length()) {
-    String dn = g_deviceName;
-    dn.toLowerCase();
-    for (unsigned i = 0; i < dn.length(); i++) {
-      char c = dn[i];
-      if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9'))) dn[i] = '-';
+String normalizeHostnameLabel(const String &source) {
+  String out;
+  out.reserve(source.length() + 8);
+  bool lastWasDash = false;
+  for (unsigned i = 0; i < source.length(); i++) {
+    char c = source[i];
+    if (c >= 'A' && c <= 'Z')
+      c = char(c - 'A' + 'a');
+    const bool keep = (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9');
+    if (keep) {
+      out += c;
+      lastWasDash = false;
+      continue;
     }
-    while (dn.length() && dn[0] == '-') dn = dn.substring(1);
-    while (dn.length() && dn[dn.length()-1] == '-') dn = dn.substring(0, dn.length()-1);
-    if (dn.length()) host += "-" + dn;
+    if (out.length() && !lastWasDash) {
+      out += '-';
+      lastWasDash = true;
+    }
   }
-  return host;
+  while (out.length() && out[0] == '-')
+    out.remove(0, 1);
+  while (out.length() && out[out.length() - 1] == '-')
+    out.remove(out.length() - 1, 1);
+  if (!out.length())
+    out = F("ionix-gpio");
+  if (!(out[0] >= 'a' && out[0] <= 'z'))
+    out = String(F("ionix-")) + out;
+  if (out.length() > 63)
+    out.remove(63);
+  while (out.length() && out[out.length() - 1] == '-')
+    out.remove(out.length() - 1, 1);
+  if (!out.length())
+    out = F("ionix-gpio");
+  return out;
+}
+
+String mdnsHostname() {
+  return normalizeHostnameLabel(apSsid());
 }
 
 void startMdnsIfReady() {
@@ -323,6 +342,79 @@ String apSsid() {
 }
 
 String apPassword() { return String(kHotspotPass); }
+
+static String readJsonString(const String &json, int valueStart) {
+  String out;
+  bool escaped = false;
+  for (int i = valueStart; i < (int)json.length(); i++) {
+    const char c = json[i];
+    if (escaped) {
+      switch (c) {
+      case 'b': out += '\b'; break;
+      case 'f': out += '\f'; break;
+      case 'n': out += '\n'; break;
+      case 'r': out += '\r'; break;
+      case 't': out += '\t'; break;
+      default: out += c; break;
+      }
+      escaped = false;
+      continue;
+    }
+    if (c == '\\') {
+      escaped = true;
+      continue;
+    }
+    if (c == '"')
+      return out;
+    out += c;
+  }
+  return String();
+}
+
+static String findMatchingReleaseAssetUrl(const String &releaseJson, const String &requiredSuffix, bool allowTarGz) {
+  const String needle = F("\"browser_download_url\":\"");
+  String wanted = requiredSuffix;
+  wanted.toLowerCase();
+  int from = 0;
+  while (true) {
+    const int idx = releaseJson.indexOf(needle, from);
+    if (idx < 0)
+      return String();
+    const int valueStart = idx + needle.length();
+    const String url = readJsonString(releaseJson, valueStart);
+    String lowerUrl = url;
+    lowerUrl.toLowerCase();
+    if ((wanted.length() && lowerUrl.endsWith(wanted)) ||
+        (allowTarGz && (lowerUrl.endsWith(".tgz") || lowerUrl.endsWith(".tar.gz"))))
+      return url;
+    from = valueStart;
+  }
+}
+
+static bool resolveLatestGithubAssetUrl(const String &repo, const String &requiredSuffix, bool allowTarGz,
+                                        String &downloadUrl, int &statusCode) {
+  downloadUrl = String();
+  statusCode = 0;
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient http;
+  const String url = String(F("https://api.github.com/repos/")) + repo + F("/releases/latest");
+  if (!http.begin(client, url))
+    return false;
+  http.setConnectTimeout(7000);
+  http.setTimeout(12000);
+  http.addHeader(F("Accept"), F("application/vnd.github+json"));
+  http.addHeader(F("User-Agent"), F("ionix-gpio"));
+  statusCode = http.GET();
+  if (statusCode != HTTP_CODE_OK) {
+    http.end();
+    return false;
+  }
+  const String releaseJson = http.getString();
+  http.end();
+  downloadUrl = findMatchingReleaseAssetUrl(releaseJson, requiredSuffix, allowTarGz);
+  return downloadUrl.length() > 0;
+}
 
 static constexpr const char *kBrandTitle = "IONIX I GPIO";
 
@@ -903,11 +995,10 @@ String pageDashboard() {
   inner += F("<input type=\"text\" id=\"atem_ip_in\" placeholder=\"ATEM IP (e.g. 192.168.1.240)\" autocomplete=\"off\" style=\"max-width:220px;\"/>");
   inner += F("<span class=\"status-led\" id=\"atem_led\"></span></div><p class=\"msg\" id=\"atem_msg\" style=\"margin-top:8px;\"></p></div>");
   inner += F("<div class=\"card\" style=\"margin-bottom:12px;padding:12px;\"><div class=\"section-title\">Companion Module</div>");
-  inner += F("<p class=\"msg\" style=\"margin-bottom:10px;\">Download the latest IONIX Companion package (.tgz) from the public GitHub release.</p>");
+  inner += F("<p class=\"msg\" style=\"margin-bottom:10px;\">Download the latest IONIX Companion package (.tgz) directly via this device.</p>");
   inner += F("<p class=\"msg\" id=\"companion_release_status\" style=\"margin-bottom:10px;\">Checking GitHub release status...</p>");
   inner += F("<div style=\"display:flex;align-items:center;gap:10px;flex-wrap:wrap;\">");
   inner += F("<button type=\"button\" class=\"btn-header\" id=\"companion_dl_btn\">DOWNLOAD LATEST</button>");
-  inner += F("<button type=\"button\" class=\"btn-header\" id=\"companion_release_btn\">OPEN RELEASE</button>");
   inner += F("</div></div>");
   inner += F("<div class=\"card\" style=\"margin-bottom:12px;padding:12px;\"><div class=\"section-title\">Firmware Update (OTA)</div>");
   inner += F("<p class=\"msg\" style=\"margin-bottom:6px;\">Installed firmware: <code id=\"ota_cur_ver\">");
@@ -918,9 +1009,8 @@ String pageDashboard() {
   inner += F("<div style=\"display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:10px;\">");
   inner += F("<button type=\"button\" class=\"btn-header\" id=\"ota_check_btn\">CHECK NOW</button>");
   inner += F("<button type=\"button\" class=\"btn-header\" id=\"ota_download_btn\" style=\"display:none;\">DOWNLOAD UPDATE</button>");
-  inner += F("<button type=\"button\" class=\"btn-header\" id=\"ota_release_btn\">OPEN RELEASE</button>");
   inner += F("</div>");
-  inner += F("<p class=\"msg\" style=\"margin-bottom:10px;\">Download the newest OTA file, then select the <code>.bin</code> file below to flash over the network. The device will reboot automatically.</p>");
+  inner += F("<p class=\"msg\" style=\"margin-bottom:10px;\">Download the newest OTA file directly via this device, then select the <code>.bin</code> file below to flash over the network. The device will reboot automatically.</p>");
   inner += F("<p class=\"msg\" style=\"margin-bottom:10px;\">mDNS hostname: <code id=\"ota_mdns_host\">-</code>.local</p>");
   inner += F("<div style=\"display:flex;align-items:center;gap:10px;flex-wrap:wrap;\">");
   inner += F("<input type=\"file\" id=\"ota_file\" accept=\".bin\" style=\"color:#ccc;font-size:13px;\"/>");
@@ -986,7 +1076,7 @@ String pageDashboard() {
 
   inner += F("<script>");
   inner += F("function postForm(u,b){return fetch(u,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:b,credentials:'same-origin'});}");
-  inner += F("var gpioSig=0,evtFails=0,testMode=false,netDirty=false,netSaving=false,updateInfo=null,firmwareRelease=null,firmwareAssetUrl='',companionAssetUrl='',companionReleaseUrl='';");
+  inner += F("var gpioSig=0,evtFails=0,testMode=false,netDirty=false,netSaving=false,updateInfo=null;");
   inner += F("function setMsg(el,text,kind){if(!el)return;el.textContent=text;el.className='msg'+(kind?' '+kind:'');}");
   inner += F("function normalizeVersion(v){return String(v||'').trim().replace(/^refs\\/tags\\//,'').replace(/^v/i,'');}");
   inner += F("function versionParts(v){var s=normalizeVersion(v);if(!s)return[0];return s.split('.').map(function(part){var m=String(part).match(/\\d+/);return m?parseInt(m[0],10):0;});}");
@@ -1000,17 +1090,16 @@ String pageDashboard() {
   inner += F("updateInfo=await r.json();if(!updateInfo.ok)throw new Error('device_info');var cur=document.getElementById('ota_cur_ver');if(cur)cur.textContent=updateInfo.firmware_version||'-';return updateInfo;}");
   inner += F("async function fetchLatestGithubRelease(repo){var r=await fetch('https://api.github.com/repos/'+repo+'/releases/latest',{cache:'no-store'});if(r.status===404)return null;if(!r.ok)throw new Error('github_'+r.status);return await r.json();}");
   inner += F("async function refreshFirmwareRelease(){var st=document.getElementById('ota_release_status'),meta=document.getElementById('ota_release_meta'),dl=document.getElementById('ota_download_btn');");
-  inner += F("setMsg(st,'Checking GitHub release status...','');if(meta){meta.style.display='none';meta.textContent='';meta.className='msg';}if(dl)dl.style.display='none';firmwareAssetUrl='';");
-  inner += F("try{var info=await ensureUpdateInfo();var rel=await fetchLatestGithubRelease(info.firmware_repo);if(!rel){setMsg(st,'No firmware release has been published on GitHub yet.','');return;}firmwareRelease=rel;");
+  inner += F("setMsg(st,'Checking GitHub release status...','');if(meta){meta.style.display='none';meta.textContent='';meta.className='msg';}if(dl)dl.style.display='none';");
+  inner += F("try{var info=await ensureUpdateInfo();var rel=await fetchLatestGithubRelease(info.firmware_repo);if(!rel){setMsg(st,'No firmware release has been published on GitHub yet.','');return;}");
   inner += F("var latest=normalizeVersion(rel.tag_name||rel.name||'');var asset=pickFirmwareAsset(rel,info.firmware_target);var newer=compareVersions(latest,info.firmware_version)>0;");
-  inner += F("if(asset)firmwareAssetUrl=asset.browser_download_url||rel.html_url||info.firmware_release_page;");
   inner += F("if(newer&&asset){setMsg(st,'Update available: v'+latest+' is newer than the installed v'+info.firmware_version+'.','ok');if(meta){meta.style.display='block';meta.textContent='Asset: '+asset.name;meta.className='msg ok';}if(dl)dl.style.display='inline-block';}");
   inner += F("else if(newer){setMsg(st,'A newer release exists (v'+latest+'), but no matching '+info.firmware_target+' OTA asset was found.','err');if(meta){meta.style.display='block';meta.textContent='Expected asset suffix: '+info.firmware_asset_suffix;meta.className='msg err';}}");
   inner += F("else{setMsg(st,'Firmware is up to date at v'+info.firmware_version+'.','ok');if(meta){meta.style.display='block';meta.textContent='Latest GitHub release: '+(latest?('v'+latest):'unknown');meta.className='msg ok';}}}catch(e){setMsg(st,'Could not check GitHub releases automatically.','err');}}");
-  inner += F("async function refreshCompanionRelease(){var st=document.getElementById('companion_release_status');setMsg(st,'Checking GitHub release status...','');companionAssetUrl='';");
-  inner += F("try{var info=await ensureUpdateInfo();companionReleaseUrl=info.companion_release_page;var rel=await fetchLatestGithubRelease(info.companion_repo);if(!rel){setMsg(st,'No Companion release has been published on GitHub yet.','');return;}companionReleaseUrl=rel.html_url||info.companion_release_page;");
-  inner += F("var asset=pickCompanionAsset(rel);if(asset){companionAssetUrl=asset.browser_download_url||rel.html_url||info.companion_release_page;setMsg(st,'Latest Companion package ready: '+asset.name,'ok');}");
-  inner += F("else{setMsg(st,'Latest Companion release found, but no .tgz package asset is attached.','err');}}catch(e){setMsg(st,'Could not query GitHub automatically. Use the release page button instead.','err');}}");
+  inner += F("async function refreshCompanionRelease(){var st=document.getElementById('companion_release_status');setMsg(st,'Checking GitHub release status...','');");
+  inner += F("try{var info=await ensureUpdateInfo();var rel=await fetchLatestGithubRelease(info.companion_repo);if(!rel){setMsg(st,'No Companion release has been published on GitHub yet.','');return;}");
+  inner += F("var asset=pickCompanionAsset(rel);if(asset){setMsg(st,'Latest Companion package ready: '+asset.name,'ok');}");
+  inner += F("else{setMsg(st,'Latest Companion release found, but no .tgz package asset is attached.','err');}}catch(e){setMsg(st,'Could not query GitHub automatically. The download endpoint may still work.','err');}}");
   inner += F("function applyTestModeUi(){var b=document.getElementById('hdr_test_btn');var m=document.getElementById('test_mode_banner');");
   inner += F("if(b)b.classList.toggle('btn-test-on',!!testMode);if(m)m.classList.toggle('show',!!testMode);}");
   inner += F("function markNetDirty(){if(!netSaving)netDirty=true;}");
@@ -1109,8 +1198,7 @@ String pageDashboard() {
   inner += F("var sdef=document.getElementById('set_default_btn');if(sdef)sdef.addEventListener('click',function(){");
   inner += F("if(!confirm('Restore default GPIO preset? Current channel list will be replaced.'))return;");
   inner += F("postForm('/settings/default','').then(function(){location.reload();});});");
-  inner += F("var cdl=document.getElementById('companion_dl_btn');if(cdl)cdl.addEventListener('click',function(){if(companionAssetUrl)window.open(companionAssetUrl,'_blank');else window.open('/api/companion/module/download','_blank');});");
-  inner += F("var crb=document.getElementById('companion_release_btn');if(crb)crb.addEventListener('click',function(){if(companionReleaseUrl)window.open(companionReleaseUrl,'_blank');else window.open('/api/companion/module/download','_blank');});");
+  inner += F("var cdl=document.getElementById('companion_dl_btn');if(cdl)cdl.addEventListener('click',function(){window.open('/api/companion/module/download','_blank');});");
   // OTA + mDNS hostname display
   inner += F("(function(){");
   inner += F("var otaHost=document.getElementById('ota_mdns_host');");
@@ -1119,8 +1207,7 @@ String pageDashboard() {
   inner += F("var otaFile=document.getElementById('ota_file'),otaBtn=document.getElementById('ota_flash_btn');");
   inner += F("var otaWrap=document.getElementById('ota_progress_wrap'),otaBar=document.getElementById('ota_progress_bar'),otaMsg=document.getElementById('ota_msg');");
   inner += F("var otaCheck=document.getElementById('ota_check_btn');if(otaCheck)otaCheck.addEventListener('click',function(){refreshFirmwareRelease();refreshCompanionRelease();});");
-  inner += F("var otaDownload=document.getElementById('ota_download_btn');if(otaDownload)otaDownload.addEventListener('click',function(){if(firmwareAssetUrl)window.open(firmwareAssetUrl,'_blank');});");
-  inner += F("var otaRelease=document.getElementById('ota_release_btn');if(otaRelease)otaRelease.addEventListener('click',function(){if(firmwareRelease&&firmwareRelease.html_url)window.open(firmwareRelease.html_url,'_blank');else if(updateInfo&&updateInfo.firmware_release_page)window.open(updateInfo.firmware_release_page,'_blank');});");
+  inner += F("var otaDownload=document.getElementById('ota_download_btn');if(otaDownload)otaDownload.addEventListener('click',function(){window.open('/api/ota/download','_blank');});");
   inner += F("if(otaBtn)otaBtn.addEventListener('click',function(){");
   inner += F("if(!otaFile||!otaFile.files||!otaFile.files.length){alert('Please select a firmware.bin file first.');return;}");
   inner += F("var f=otaFile.files[0];if(!f.name.endsWith('.bin')){alert('File must be a .bin firmware file.');return;}");
@@ -1696,7 +1783,45 @@ void handleApiCompanionGpoBulkSet() {
   sendCompanionJson("true");
 }
 
-void handleApiCompanionModuleDownload() { sendRedirect(String(kCompanionModuleDownloadUrl)); }
+void handleApiFirmwareDownload() {
+  if (kRequireWebLogin && !cookieMatchesSession()) {
+    g_server.send(401, F("text/plain; charset=utf-8"), F("Unauthorized"));
+    return;
+  }
+  String downloadUrl;
+  int statusCode = 0;
+  if (!resolveLatestGithubAssetUrl(String(kFirmwareReleaseRepo), String(kFirmwareAssetSuffix), false, downloadUrl, statusCode)) {
+    g_server.sendHeader(F("Cache-Control"), F("no-store"));
+    if (statusCode == 404)
+      g_server.send(404, F("text/plain; charset=utf-8"), F("No firmware release available."));
+    else if (statusCode == HTTP_CODE_OK)
+      g_server.send(404, F("text/plain; charset=utf-8"), F("No matching OTA asset found in the latest release."));
+    else
+      g_server.send(502, F("text/plain; charset=utf-8"), F("Could not resolve the latest firmware download."));
+    return;
+  }
+  sendRedirect(downloadUrl);
+}
+
+void handleApiCompanionModuleDownload() {
+  if (kRequireWebLogin && !cookieMatchesSession()) {
+    g_server.send(401, F("text/plain; charset=utf-8"), F("Unauthorized"));
+    return;
+  }
+  String downloadUrl;
+  int statusCode = 0;
+  if (!resolveLatestGithubAssetUrl(String(kCompanionReleaseRepo), String(), true, downloadUrl, statusCode)) {
+    g_server.sendHeader(F("Cache-Control"), F("no-store"));
+    if (statusCode == 404)
+      g_server.send(404, F("text/plain; charset=utf-8"), F("No Companion release available."));
+    else if (statusCode == HTTP_CODE_OK)
+      g_server.send(404, F("text/plain; charset=utf-8"), F("No Companion package asset found in the latest release."));
+    else
+      g_server.send(502, F("text/plain; charset=utf-8"), F("Could not resolve the latest Companion download."));
+    return;
+  }
+  sendRedirect(downloadUrl);
+}
 
 /** Long-poll: returns when `sig` differs from `since`, or after ~28 ms with `changed:false`; ticks ATEM + GPIO outputs while blocked. */
 void handleApiGpioWait() {
@@ -1869,11 +1994,6 @@ void handleDeviceNamePost() {
   if (name.length() > 32) name = name.substring(0, 32);
   g_deviceName = name;
   g_prefs.putString("dev_name", g_deviceName);
-  // Restart mDNS with updated hostname
-  if (g_mdnsStarted) {
-    MDNS.end();
-    g_mdnsStarted = false;
-  }
   g_server.sendHeader(F("Cache-Control"), F("no-store"));
   g_server.send(200, F("application/json"), F("{\"ok\":true}"));
 }
@@ -2070,6 +2190,7 @@ void registerHandlers() {
   g_server.on(F("/api/companion/gpo/set"), HTTP_POST, handleApiCompanionGpoSet);
   g_server.on(F("/api/companion/gpo/set/bulk"), HTTP_POST, handleApiCompanionGpoBulkSet);
   g_server.on(F("/api/companion/module/download"), HTTP_GET, handleApiCompanionModuleDownload);
+  g_server.on(F("/api/ota/download"), HTTP_GET, handleApiFirmwareDownload);
   g_server.on(F("/api/gpio/hold"), HTTP_POST, handleGpioHoldPost);
   g_server.on(F("/api/gpio/invert"), HTTP_POST, handleGpioInvertPost);
   g_server.on(F("/api/gpio/polarity"), HTTP_POST, handleGpioPolarityPost);
