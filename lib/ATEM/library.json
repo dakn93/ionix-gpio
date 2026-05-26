@@ -1,0 +1,8 @@
+{
+  "name": "ATEM",
+  "version": "0.1.0",
+  "description": "BMD ATEM UDP (mathijsk fork, WiFiUDP + extended tally for ESP32)",
+  "license": "GPL-3.0",
+  "frameworks": "arduino",
+  "platforms": "espressif32"
+}

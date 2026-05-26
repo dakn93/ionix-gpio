@@ -1,0 +1,3 @@
+.pio/
+logs/
+ionix-gpio*.bin

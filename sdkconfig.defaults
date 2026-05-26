@@ -1,0 +1,2 @@
+# Larger loop stack for libember_slim BER decode bursts (Ember+ viewer tree open).
+CONFIG_ARDUINO_LOOP_STACK_SIZE=16384
