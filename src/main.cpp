@@ -24,7 +24,7 @@
 #include <pins.h>
 
 #ifndef IONIX_FW_VERSION
-#define IONIX_FW_VERSION "0.1.1"
+#define IONIX_FW_VERSION "0.1.2"
 #endif
 
 namespace {
@@ -371,30 +371,144 @@ static String readJsonString(const String &json, int valueStart) {
   return String();
 }
 
-static String findMatchingReleaseAssetUrl(const String &releaseJson, const String &requiredSuffix, bool allowTarGz) {
-  const String needle = F("\"browser_download_url\":\"");
+enum OtaBusySource : uint8_t {
+  kOtaSourceNone = 0,
+  kOtaSourceManual = 1,
+  kOtaSourceDevice = 2,
+};
+
+struct GithubReleaseInfo {
+  int statusCode = 0;
+  String latestVersion;
+  String assetName;
+  String assetUrl;
+  bool assetMatched = false;
+};
+
+struct OtaRuntimeState {
+  bool busy = false;
+  bool updateAvailable = false;
+  bool assetMatched = false;
+  bool rebootPending = false;
+  uint8_t source = kOtaSourceNone;
+  int progressPct = 0;
+  uint32_t bytesDone = 0;
+  uint32_t totalBytes = 0;
+  int httpStatus = 0;
+  char latestVersion[24] = {0};
+  char assetName[96] = {0};
+  char phase[24] = {0};
+  char message[192] = {0};
+};
+
+portMUX_TYPE g_otaStateMux = portMUX_INITIALIZER_UNLOCKED;
+OtaRuntimeState g_otaRuntime;
+TaskHandle_t g_otaDownloadTaskHandle = nullptr;
+bool g_manualOtaAccepted = false;
+uint32_t g_otaRebootAtMs = 0;
+
+static void copyTextBounded(char *dst, size_t dstSize, const char *src) {
+  if (!dst || dstSize == 0)
+    return;
+  size_t i = 0;
+  if (src) {
+    while (src[i] && i + 1 < dstSize) {
+      dst[i] = src[i];
+      ++i;
+    }
+  }
+  dst[i] = '\0';
+}
+
+static String normalizeVersionToken(const String &raw) {
+  String out = raw;
+  out.trim();
+  if (out.startsWith(F("refs/tags/")))
+    out = out.substring(10);
+  if (out.startsWith("v") || out.startsWith("V"))
+    out = out.substring(1);
+  return out;
+}
+
+static int compareVersionStrings(const String &lhsRaw, const String &rhsRaw) {
+  const String lhs = normalizeVersionToken(lhsRaw);
+  const String rhs = normalizeVersionToken(rhsRaw);
+  int li = 0;
+  int ri = 0;
+  for (int part = 0; part < 8; ++part) {
+    int lv = 0;
+    int rv = 0;
+    while (li < (int)lhs.length() && lhs[li] != '.' && (lhs[li] < '0' || lhs[li] > '9'))
+      ++li;
+    while (ri < (int)rhs.length() && rhs[ri] != '.' && (rhs[ri] < '0' || rhs[ri] > '9'))
+      ++ri;
+    while (li < (int)lhs.length() && lhs[li] >= '0' && lhs[li] <= '9') {
+      lv = lv * 10 + (lhs[li] - '0');
+      ++li;
+    }
+    while (ri < (int)rhs.length() && rhs[ri] >= '0' && rhs[ri] <= '9') {
+      rv = rv * 10 + (rhs[ri] - '0');
+      ++ri;
+    }
+    if (lv != rv)
+      return lv > rv ? 1 : -1;
+    while (li < (int)lhs.length() && lhs[li] != '.')
+      ++li;
+    while (ri < (int)rhs.length() && rhs[ri] != '.')
+      ++ri;
+    if (li < (int)lhs.length() && lhs[li] == '.')
+      ++li;
+    if (ri < (int)rhs.length() && rhs[ri] == '.')
+      ++ri;
+    if (li >= (int)lhs.length() && ri >= (int)rhs.length())
+      break;
+  }
+  return 0;
+}
+
+static String readJsonNamedString(const String &json, const char *fieldName) {
+  String needle = "\"";
+  needle += fieldName;
+  needle += F("\":\"");
+  const int idx = json.indexOf(needle);
+  if (idx < 0)
+    return String();
+  return readJsonString(json, idx + needle.length());
+}
+
+static bool findMatchingReleaseAsset(const String &releaseJson, const String &requiredSuffix, bool allowTarGz,
+                                     String &assetName, String &assetUrl) {
+  const String urlNeedle = F("\"browser_download_url\":\"");
   String wanted = requiredSuffix;
   wanted.toLowerCase();
+  assetName = String();
+  assetUrl = String();
   int from = 0;
   while (true) {
-    const int idx = releaseJson.indexOf(needle, from);
+    const int idx = releaseJson.indexOf(urlNeedle, from);
     if (idx < 0)
-      return String();
-    const int valueStart = idx + needle.length();
+      return false;
+    const int valueStart = idx + urlNeedle.length();
     const String url = readJsonString(releaseJson, valueStart);
     String lowerUrl = url;
     lowerUrl.toLowerCase();
     if ((wanted.length() && lowerUrl.endsWith(wanted)) ||
-        (allowTarGz && (lowerUrl.endsWith(".tgz") || lowerUrl.endsWith(".tar.gz"))))
-      return url;
+        (allowTarGz && (lowerUrl.endsWith(".tgz") || lowerUrl.endsWith(".tar.gz")))) {
+      assetUrl = url;
+      const int slash = url.lastIndexOf('/');
+      assetName = slash >= 0 ? url.substring(slash + 1) : url;
+      const int queryPos = assetName.indexOf('?');
+      if (queryPos >= 0)
+        assetName = assetName.substring(0, queryPos);
+      return true;
+    }
     from = valueStart;
   }
 }
 
-static bool resolveLatestGithubAssetUrl(const String &repo, const String &requiredSuffix, bool allowTarGz,
-                                        String &downloadUrl, int &statusCode) {
-  downloadUrl = String();
-  statusCode = 0;
+static bool resolveLatestGithubRelease(const String &repo, const String &requiredSuffix, bool allowTarGz,
+                                       GithubReleaseInfo &info) {
+  info = GithubReleaseInfo();
   WiFiClientSecure client;
   client.setInsecure();
   HTTPClient http;
@@ -403,17 +517,293 @@ static bool resolveLatestGithubAssetUrl(const String &repo, const String &requir
     return false;
   http.setConnectTimeout(7000);
   http.setTimeout(12000);
+  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
   http.addHeader(F("Accept"), F("application/vnd.github+json"));
   http.addHeader(F("User-Agent"), F("ionix-gpio"));
-  statusCode = http.GET();
-  if (statusCode != HTTP_CODE_OK) {
+  info.statusCode = http.GET();
+  if (info.statusCode != HTTP_CODE_OK) {
     http.end();
     return false;
   }
   const String releaseJson = http.getString();
   http.end();
-  downloadUrl = findMatchingReleaseAssetUrl(releaseJson, requiredSuffix, allowTarGz);
-  return downloadUrl.length() > 0;
+  info.latestVersion = normalizeVersionToken(readJsonNamedString(releaseJson, "tag_name"));
+  info.assetMatched = findMatchingReleaseAsset(releaseJson, requiredSuffix, allowTarGz, info.assetName, info.assetUrl);
+  return true;
+}
+
+static bool resolveLatestGithubAssetUrl(const String &repo, const String &requiredSuffix, bool allowTarGz,
+                                        String &downloadUrl, int &statusCode) {
+  GithubReleaseInfo info;
+  if (!resolveLatestGithubRelease(repo, requiredSuffix, allowTarGz, info)) {
+    downloadUrl = String();
+    statusCode = info.statusCode;
+    return false;
+  }
+  downloadUrl = info.assetUrl;
+  statusCode = info.statusCode;
+  return info.assetMatched && downloadUrl.length() > 0;
+}
+
+static void otaResetRuntimeState() {
+  portENTER_CRITICAL(&g_otaStateMux);
+  g_otaRuntime = OtaRuntimeState();
+  g_otaRebootAtMs = 0;
+  copyTextBounded(g_otaRuntime.phase, sizeof(g_otaRuntime.phase), "idle");
+  copyTextBounded(g_otaRuntime.message, sizeof(g_otaRuntime.message), "Idle.");
+  portEXIT_CRITICAL(&g_otaStateMux);
+}
+
+static OtaRuntimeState otaSnapshot() {
+  OtaRuntimeState snapshot;
+  portENTER_CRITICAL(&g_otaStateMux);
+  snapshot = g_otaRuntime;
+  portEXIT_CRITICAL(&g_otaStateMux);
+  return snapshot;
+}
+
+static void otaRememberRelease(const String &latestVersion, const String &assetName, bool updateAvailable,
+                               bool assetMatched, int httpStatus) {
+  portENTER_CRITICAL(&g_otaStateMux);
+  copyTextBounded(g_otaRuntime.latestVersion, sizeof(g_otaRuntime.latestVersion), latestVersion.c_str());
+  copyTextBounded(g_otaRuntime.assetName, sizeof(g_otaRuntime.assetName), assetName.c_str());
+  g_otaRuntime.updateAvailable = updateAvailable;
+  g_otaRuntime.assetMatched = assetMatched;
+  g_otaRuntime.httpStatus = httpStatus;
+  portEXIT_CRITICAL(&g_otaStateMux);
+}
+
+static bool otaTryBegin(OtaBusySource source, const char *phase, const char *message) {
+  bool started = false;
+  portENTER_CRITICAL(&g_otaStateMux);
+  if (!g_otaRuntime.busy) {
+    g_otaRuntime.busy = true;
+    g_otaRuntime.rebootPending = false;
+    g_otaRebootAtMs = 0;
+    g_otaRuntime.source = source;
+    g_otaRuntime.progressPct = 0;
+    g_otaRuntime.bytesDone = 0;
+    g_otaRuntime.totalBytes = 0;
+    copyTextBounded(g_otaRuntime.phase, sizeof(g_otaRuntime.phase), phase);
+    copyTextBounded(g_otaRuntime.message, sizeof(g_otaRuntime.message), message);
+    started = true;
+  }
+  portEXIT_CRITICAL(&g_otaStateMux);
+  return started;
+}
+
+static void otaSetProgress(OtaBusySource source, const char *phase, const char *message, int progressPct,
+                           uint32_t bytesDone, uint32_t totalBytes) {
+  if (progressPct < 0)
+    progressPct = 0;
+  if (progressPct > 100)
+    progressPct = 100;
+  portENTER_CRITICAL(&g_otaStateMux);
+  if (g_otaRuntime.source == source) {
+    g_otaRuntime.busy = true;
+    g_otaRuntime.progressPct = progressPct;
+    g_otaRuntime.bytesDone = bytesDone;
+    g_otaRuntime.totalBytes = totalBytes;
+    copyTextBounded(g_otaRuntime.phase, sizeof(g_otaRuntime.phase), phase);
+    copyTextBounded(g_otaRuntime.message, sizeof(g_otaRuntime.message), message);
+  }
+  portEXIT_CRITICAL(&g_otaStateMux);
+}
+
+static void otaFinishError(OtaBusySource source, int httpStatus, const char *message) {
+  portENTER_CRITICAL(&g_otaStateMux);
+  if (g_otaRuntime.source == source || source == kOtaSourceNone) {
+    g_otaRuntime.busy = false;
+    g_otaRuntime.rebootPending = false;
+    g_otaRebootAtMs = 0;
+    g_otaRuntime.source = kOtaSourceNone;
+    g_otaRuntime.httpStatus = httpStatus;
+    copyTextBounded(g_otaRuntime.phase, sizeof(g_otaRuntime.phase), "error");
+    copyTextBounded(g_otaRuntime.message, sizeof(g_otaRuntime.message), message);
+  }
+  portEXIT_CRITICAL(&g_otaStateMux);
+}
+
+static void otaScheduleReboot(const char *message) {
+  portENTER_CRITICAL(&g_otaStateMux);
+  g_otaRuntime.busy = false;
+  g_otaRuntime.rebootPending = true;
+  g_otaRuntime.source = kOtaSourceNone;
+  g_otaRuntime.progressPct = 100;
+  copyTextBounded(g_otaRuntime.phase, sizeof(g_otaRuntime.phase), "reboot");
+  copyTextBounded(g_otaRuntime.message, sizeof(g_otaRuntime.message), message);
+  g_otaRebootAtMs = millis() + 1500;
+  portEXIT_CRITICAL(&g_otaStateMux);
+}
+
+static bool otaHasNetworkUplink() {
+#if defined(USE_ETHERNET_PORT)
+  if (ETH.linkUp()) {
+    const IPAddress ethIp = ETH.localIP();
+    if (ethIp[0] || ethIp[1] || ethIp[2] || ethIp[3])
+      return true;
+  }
+#endif
+  if (WiFi.status() == WL_CONNECTED) {
+    const IPAddress wifiIp = WiFi.localIP();
+    if (wifiIp[0] || wifiIp[1] || wifiIp[2] || wifiIp[3])
+      return true;
+  }
+  return false;
+}
+
+static bool otaRebootDue() {
+  bool due = false;
+  portENTER_CRITICAL(&g_otaStateMux);
+  due = g_otaRuntime.rebootPending && g_otaRebootAtMs != 0 &&
+        static_cast<int32_t>(millis() - g_otaRebootAtMs) >= 0;
+  portEXIT_CRITICAL(&g_otaStateMux);
+  return due;
+}
+
+static void otaDeviceUpdateTask(void *) {
+  GithubReleaseInfo release;
+  if (!resolveLatestGithubRelease(String(kFirmwareReleaseRepo), String(kFirmwareAssetSuffix), false, release)) {
+    if (release.statusCode == 404)
+      otaFinishError(kOtaSourceDevice, release.statusCode, "No published firmware release was found on GitHub.");
+    else
+      otaFinishError(kOtaSourceDevice, release.statusCode, "Could not contact GitHub for the latest firmware release.");
+    g_otaDownloadTaskHandle = nullptr;
+    vTaskDelete(nullptr);
+    return;
+  }
+
+  const bool updateAvailable = compareVersionStrings(release.latestVersion, String(kFirmwareVersion)) > 0;
+  otaRememberRelease(release.latestVersion, release.assetName, updateAvailable, release.assetMatched, release.statusCode);
+
+  if (!updateAvailable) {
+    otaFinishError(kOtaSourceDevice, HTTP_CODE_OK, "This device is already running the latest firmware.");
+    g_otaDownloadTaskHandle = nullptr;
+    vTaskDelete(nullptr);
+    return;
+  }
+  if (!release.assetMatched || !release.assetUrl.length()) {
+    otaFinishError(kOtaSourceDevice, HTTP_CODE_OK, "A newer release exists, but no matching OTA asset was found for this board.");
+    g_otaDownloadTaskHandle = nullptr;
+    vTaskDelete(nullptr);
+    return;
+  }
+
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient http;
+  if (!http.begin(client, release.assetUrl)) {
+    otaFinishError(kOtaSourceDevice, 0, "Could not open the OTA download URL.");
+    g_otaDownloadTaskHandle = nullptr;
+    vTaskDelete(nullptr);
+    return;
+  }
+  http.setConnectTimeout(10000);
+  http.setTimeout(15000);
+  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+  http.addHeader(F("User-Agent"), F("ionix-gpio"));
+  otaSetProgress(kOtaSourceDevice, "download", "Downloading and flashing firmware...", 0, 0, 0);
+
+  const int code = http.GET();
+  if (code != HTTP_CODE_OK) {
+    http.end();
+    otaFinishError(kOtaSourceDevice, code, "GitHub returned an unexpected response for the OTA asset download.");
+    g_otaDownloadTaskHandle = nullptr;
+    vTaskDelete(nullptr);
+    return;
+  }
+
+  const String contentType = http.header("Content-Type");
+  String loweredContentType = contentType;
+  loweredContentType.toLowerCase();
+  if (loweredContentType.startsWith("text/") || loweredContentType.indexOf("html") >= 0) {
+    http.end();
+    otaFinishError(kOtaSourceDevice, code, "The downloaded asset was not a firmware binary.");
+    g_otaDownloadTaskHandle = nullptr;
+    vTaskDelete(nullptr);
+    return;
+  }
+
+  const int totalLength = http.getSize();
+  const size_t updateLength = totalLength > 0 ? static_cast<size_t>(totalLength) : UPDATE_SIZE_UNKNOWN;
+  if (!Update.begin(updateLength)) {
+    http.end();
+    otaFinishError(kOtaSourceDevice, code, Update.errorString());
+    g_otaDownloadTaskHandle = nullptr;
+    vTaskDelete(nullptr);
+    return;
+  }
+
+  WiFiClient *stream = http.getStreamPtr();
+  uint8_t buffer[4096];
+  uint32_t writtenTotal = 0;
+  bool checkedHeader = false;
+  int remaining = totalLength;
+  bool failed = false;
+  const char *failMessage = nullptr;
+
+  while (http.connected() && (remaining > 0 || remaining == -1)) {
+    const size_t available = stream->available();
+    if (!available) {
+      delay(1);
+      continue;
+    }
+    size_t toRead = available;
+    if (toRead > sizeof(buffer))
+      toRead = sizeof(buffer);
+    const int bytesRead = stream->readBytes(buffer, toRead);
+    if (bytesRead <= 0)
+      continue;
+    if (!checkedHeader) {
+      checkedHeader = true;
+      if (buffer[0] != 0xE9) {
+        failMessage = "The downloaded file does not look like a valid ESP firmware image.";
+        failed = true;
+        break;
+      }
+    }
+    const size_t bytesWritten = Update.write(buffer, static_cast<size_t>(bytesRead));
+    if (bytesWritten != static_cast<size_t>(bytesRead)) {
+      failMessage = Update.errorString();
+      failed = true;
+      break;
+    }
+    writtenTotal += static_cast<uint32_t>(bytesWritten);
+    if (remaining > 0)
+      remaining -= bytesRead;
+    int progress = 0;
+    if (totalLength > 0)
+      progress = static_cast<int>((static_cast<uint64_t>(writtenTotal) * 100ULL) / static_cast<uint32_t>(totalLength));
+    otaSetProgress(kOtaSourceDevice, "flash", "Downloading and flashing firmware...", progress, writtenTotal,
+                   totalLength > 0 ? static_cast<uint32_t>(totalLength) : 0);
+  }
+
+  if (!failed && totalLength > 0 && writtenTotal != static_cast<uint32_t>(totalLength)) {
+    failMessage = "The OTA download ended before the full firmware image was received.";
+    failed = true;
+  }
+
+  if (failed) {
+    Update.abort();
+    http.end();
+    otaFinishError(kOtaSourceDevice, code, failMessage ? failMessage : "OTA update failed.");
+    g_otaDownloadTaskHandle = nullptr;
+    vTaskDelete(nullptr);
+    return;
+  }
+
+  if (!Update.end(true)) {
+    http.end();
+    otaFinishError(kOtaSourceDevice, code, Update.errorString());
+    g_otaDownloadTaskHandle = nullptr;
+    vTaskDelete(nullptr);
+    return;
+  }
+
+  http.end();
+  otaScheduleReboot("Firmware update installed successfully. Rebooting device...");
+  g_otaDownloadTaskHandle = nullptr;
+  vTaskDelete(nullptr);
 }
 
 static constexpr const char *kBrandTitle = "IONIX I GPIO";
@@ -1004,13 +1394,14 @@ String pageDashboard() {
   inner += F("<p class=\"msg\" style=\"margin-bottom:6px;\">Installed firmware: <code id=\"ota_cur_ver\">");
   inner += String(kFirmwareVersion);
   inner += F("</code></p>");
+  inner += F("<p class=\"msg\" style=\"margin-bottom:6px;\">Latest published firmware: <code id=\"ota_latest_ver\">-</code></p>");
   inner += F("<p class=\"msg\" id=\"ota_release_status\" style=\"margin-bottom:6px;\">Checking GitHub release status...</p>");
   inner += F("<p class=\"msg\" id=\"ota_release_meta\" style=\"margin-bottom:10px;display:none;\"></p>");
   inner += F("<div style=\"display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:10px;\">");
   inner += F("<button type=\"button\" class=\"btn-header\" id=\"ota_check_btn\">CHECK NOW</button>");
-  inner += F("<button type=\"button\" class=\"btn-header\" id=\"ota_download_btn\" style=\"display:none;\">DOWNLOAD UPDATE</button>");
+  inner += F("<button type=\"button\" class=\"btn-header\" id=\"ota_update_btn\" style=\"display:none;\">UPDATE</button>");
   inner += F("</div>");
-  inner += F("<p class=\"msg\" style=\"margin-bottom:10px;\">Download the newest OTA file directly via this device, then select the <code>.bin</code> file below to flash over the network. The device will reboot automatically.</p>");
+  inner += F("<p class=\"msg\" style=\"margin-bottom:10px;\">If a newer matching release exists, click <strong>UPDATE</strong> and the device will download the OTA asset from GitHub, flash it locally and reboot automatically. Manual file upload remains available below as fallback.</p>");
   inner += F("<p class=\"msg\" style=\"margin-bottom:10px;\">mDNS hostname: <code id=\"ota_mdns_host\">-</code>.local</p>");
   inner += F("<div style=\"display:flex;align-items:center;gap:10px;flex-wrap:wrap;\">");
   inner += F("<input type=\"file\" id=\"ota_file\" accept=\".bin\" style=\"color:#ccc;font-size:13px;\"/>");
@@ -1088,14 +1479,17 @@ String pageDashboard() {
   inner += F("function pickCompanionAsset(rel){if(!rel||!rel.assets||!rel.assets.length)return null;return rel.assets.find(function(a){var n=String((a&&a.name)||'').toLowerCase();return n.endsWith('.tgz')||n.endsWith('.tar.gz');})||null;}");
   inner += F("async function ensureUpdateInfo(){if(updateInfo)return updateInfo;var r=await fetch('/api/update/info',{credentials:'same-origin',cache:'no-store'});if(!r.ok)throw new Error('device_info');");
   inner += F("updateInfo=await r.json();if(!updateInfo.ok)throw new Error('device_info');var cur=document.getElementById('ota_cur_ver');if(cur)cur.textContent=updateInfo.firmware_version||'-';return updateInfo;}");
+  inner += F("async function parseJsonSafe(resp){try{return await resp.json();}catch(e){return null;}}");
   inner += F("async function fetchLatestGithubRelease(repo){var r=await fetch('https://api.github.com/repos/'+repo+'/releases/latest',{cache:'no-store'});if(r.status===404)return null;if(!r.ok)throw new Error('github_'+r.status);return await r.json();}");
-  inner += F("async function refreshFirmwareRelease(){var st=document.getElementById('ota_release_status'),meta=document.getElementById('ota_release_meta'),dl=document.getElementById('ota_download_btn');");
-  inner += F("setMsg(st,'Checking GitHub release status...','');if(meta){meta.style.display='none';meta.textContent='';meta.className='msg';}if(dl)dl.style.display='none';");
-  inner += F("try{var info=await ensureUpdateInfo();var rel=await fetchLatestGithubRelease(info.firmware_repo);if(!rel){setMsg(st,'No firmware release has been published on GitHub yet.','');return;}");
-  inner += F("var latest=normalizeVersion(rel.tag_name||rel.name||'');var asset=pickFirmwareAsset(rel,info.firmware_target);var newer=compareVersions(latest,info.firmware_version)>0;");
-  inner += F("if(newer&&asset){setMsg(st,'Update available: v'+latest+' is newer than the installed v'+info.firmware_version+'.','ok');if(meta){meta.style.display='block';meta.textContent='Asset: '+asset.name;meta.className='msg ok';}if(dl)dl.style.display='inline-block';}");
-  inner += F("else if(newer){setMsg(st,'A newer release exists (v'+latest+'), but no matching '+info.firmware_target+' OTA asset was found.','err');if(meta){meta.style.display='block';meta.textContent='Expected asset suffix: '+info.firmware_asset_suffix;meta.className='msg err';}}");
-  inner += F("else{setMsg(st,'Firmware is up to date at v'+info.firmware_version+'.','ok');if(meta){meta.style.display='block';meta.textContent='Latest GitHub release: '+(latest?('v'+latest):'unknown');meta.className='msg ok';}}}catch(e){setMsg(st,'Could not check GitHub releases automatically.','err');}}");
+  inner += F("async function refreshFirmwareRelease(){var st=document.getElementById('ota_release_status'),meta=document.getElementById('ota_release_meta'),btn=document.getElementById('ota_update_btn'),latestEl=document.getElementById('ota_latest_ver');");
+  inner += F("setMsg(st,'Checking device OTA status...','');if(meta){meta.style.display='none';meta.textContent='';meta.className='msg';}if(btn){btn.style.display='none';btn.disabled=false;}if(latestEl)latestEl.textContent='-';");
+  inner += F("try{var info=await ensureUpdateInfo();var r=await fetch('/api/ota/check',{method:'POST',credentials:'same-origin',cache:'no-store'});var j=await parseJsonSafe(r);");
+  inner += F("if(!r.ok||!j||!j.ok)throw new Error((j&&j.message)||'ota_check_failed');if(latestEl)latestEl.textContent=j.release_found&&j.latest_version?('v'+j.latest_version):'-';");
+  inner += F("if(!j.release_found){setMsg(st,'No firmware release has been published on GitHub yet.','');if(meta){meta.style.display='block';meta.textContent='Expected OTA asset suffix: '+info.firmware_asset_suffix;meta.className='msg';}return;}");
+  inner += F("if(j.update_available){setMsg(st,'Update available: v'+j.latest_version+' is newer than the installed v'+(j.installed_version||info.firmware_version)+'.','ok');if(meta){meta.style.display='block';meta.textContent='Matched OTA asset: '+(j.asset_name||info.firmware_asset_suffix);meta.className='msg ok';}if(btn)btn.style.display='inline-block';}");
+  inner += F("else if(j.newer_release){setMsg(st,'A newer release exists (v'+j.latest_version+'), but no matching '+info.firmware_target+' OTA asset was found.','err');if(meta){meta.style.display='block';meta.textContent='Expected asset suffix: '+info.firmware_asset_suffix;meta.className='msg err';}}");
+  inner += F("else{setMsg(st,'Firmware is up to date at v'+(j.installed_version||info.firmware_version)+'.','ok');if(meta){meta.style.display='block';meta.textContent='Latest GitHub release: '+(j.latest_version?('v'+j.latest_version):'unknown');meta.className='msg ok';}}}");
+  inner += F("catch(e){setMsg(st,'Could not check GitHub releases automatically.','err');if(meta){meta.style.display='block';meta.textContent=(e&&e.message&&e.message!=='ota_check_failed')?e.message:'Check the device network connection and GitHub availability.';meta.className='msg err';}}}");
   inner += F("async function refreshCompanionRelease(){var st=document.getElementById('companion_release_status');setMsg(st,'Checking GitHub release status...','');");
   inner += F("try{var info=await ensureUpdateInfo();var rel=await fetchLatestGithubRelease(info.companion_repo);if(!rel){setMsg(st,'No Companion release has been published on GitHub yet.','');return;}");
   inner += F("var asset=pickCompanionAsset(rel);if(asset){setMsg(st,'Latest Companion package ready: '+asset.name,'ok');}");
@@ -1207,24 +1601,34 @@ String pageDashboard() {
   inner += F("var otaFile=document.getElementById('ota_file'),otaBtn=document.getElementById('ota_flash_btn');");
   inner += F("var otaWrap=document.getElementById('ota_progress_wrap'),otaBar=document.getElementById('ota_progress_bar'),otaMsg=document.getElementById('ota_msg');");
   inner += F("var otaCheck=document.getElementById('ota_check_btn');if(otaCheck)otaCheck.addEventListener('click',function(){refreshFirmwareRelease();refreshCompanionRelease();});");
-  inner += F("var otaDownload=document.getElementById('ota_download_btn');if(otaDownload)otaDownload.addEventListener('click',function(){window.open('/api/ota/download','_blank');});");
+  inner += F("var otaUpdate=document.getElementById('ota_update_btn'),otaPollTimer=0;");
+  inner += F("function setOtaBusyUi(busy){if(otaCheck)otaCheck.disabled=!!busy;if(otaUpdate)otaUpdate.disabled=!!busy;if(otaBtn)otaBtn.disabled=!!busy;if(otaFile)otaFile.disabled=!!busy;}");
+  inner += F("function clearOtaPoll(){if(otaPollTimer){clearTimeout(otaPollTimer);otaPollTimer=0;}}");
+  inner += F("function showOtaProgress(msg,pct){if(otaWrap)otaWrap.style.display='block';if(otaMsg)otaMsg.textContent=msg||'';if(otaBar)otaBar.style.width=Math.max(0,Math.min(100,pct||0))+'%';}");
+  inner += F("function scheduleOtaPoll(ms){clearOtaPoll();otaPollTimer=setTimeout(function(){pollOtaStatus();},ms||1000);}");
+  inner += F("async function pollOtaStatus(){clearOtaPoll();try{var r=await fetch('/api/ota/status',{credentials:'same-origin',cache:'no-store'});var j=await parseJsonSafe(r);if(!r.ok||!j||!j.ok)throw new Error('ota_status_failed');");
+  inner += F("if(j.message||j.busy||j.reboot_pending)showOtaProgress(j.message||'',parseInt(j.progress_pct||0,10)||0);if(j.busy){setOtaBusyUi(true);scheduleOtaPoll(900);return;}");
+  inner += F("if(j.reboot_pending){setOtaBusyUi(true);showOtaProgress(j.message||'Firmware installed. Rebooting device...',100);scheduleOtaPoll(1200);return;}setOtaBusyUi(false);if(j.phase==='error'&&j.message)showOtaProgress(j.message,parseInt(j.progress_pct||0,10)||0);refreshFirmwareRelease();}");
+  inner += F("catch(e){setOtaBusyUi(false);if(otaMsg&&otaWrap&&otaWrap.style.display==='block')otaMsg.textContent='Waiting for device reconnect after OTA...';}}");
+  inner += F("if(otaUpdate)otaUpdate.addEventListener('click',async function(){if(!confirm('Install the latest matching OTA firmware from GitHub now? The device will reboot automatically.'))return;");
+  inner += F("setOtaBusyUi(true);showOtaProgress('Starting device update...',0);try{var r=await fetch('/api/ota/start',{method:'POST',credentials:'same-origin',cache:'no-store'});var j=await parseJsonSafe(r);");
+  inner += F("if(!r.ok||!j||!j.ok)throw new Error((j&&j.message)||'Could not start OTA.');pollOtaStatus();}catch(e){setOtaBusyUi(false);showOtaProgress((e&&e.message)||'Could not start OTA.',0);}});");
   inner += F("if(otaBtn)otaBtn.addEventListener('click',function(){");
   inner += F("if(!otaFile||!otaFile.files||!otaFile.files.length){alert('Please select a firmware.bin file first.');return;}");
   inner += F("var f=otaFile.files[0];if(!f.name.endsWith('.bin')){alert('File must be a .bin firmware file.');return;}");
   inner += F("var fd=new FormData();fd.append('firmware',f);");
-  inner += F("if(otaWrap)otaWrap.style.display='block';if(otaMsg)otaMsg.textContent='Uploading '+f.name+' ('+Math.round(f.size/1024)+' KB)...';if(otaBar)otaBar.style.width='0%';");
+  inner += F("clearOtaPoll();setOtaBusyUi(true);showOtaProgress('Uploading '+f.name+' ('+Math.round(f.size/1024)+' KB)...',0);");
   inner += F("var xhr=new XMLHttpRequest();xhr.open('POST','/api/ota/upload');xhr.withCredentials=true;");
   inner += F("xhr.upload.onprogress=function(e){if(e.lengthComputable&&otaBar)otaBar.style.width=Math.round(e.loaded/e.total*90)+'%';};");
-  inner += F("xhr.onload=function(){if(otaBar)otaBar.style.width='100%';");
-  inner += F("try{var j=JSON.parse(xhr.responseText);if(j.ok){if(otaMsg)otaMsg.textContent='Flash successful! Rebooting device...';}");
-  inner += F("else{if(otaMsg)otaMsg.textContent='Error: '+(j.err||'unknown');}}catch(e){if(otaMsg)otaMsg.textContent='Upload complete. Rebooting...';}};");
-  inner += F("xhr.onerror=function(){if(otaMsg)otaMsg.textContent='Upload failed. Check connection.';};");
-  inner += F("xhr.send(fd);});})();");
+  inner += F("xhr.onload=function(){try{var j=JSON.parse(xhr.responseText);if(j.ok){showOtaProgress('Flash successful! Rebooting device...',100);}");
+  inner += F("else{showOtaProgress('Error: '+(j.err||'unknown'),0);setOtaBusyUi(false);}}catch(e){showOtaProgress('Upload complete. Rebooting...',100);}};");
+  inner += F("xhr.onerror=function(){showOtaProgress('Upload failed. Check connection.',0);setOtaBusyUi(false);};");
+  inner += F("xhr.send(fd);});pollOtaStatus();})();");
   inner += F("var sr=document.getElementById('set_rows');if(sr)sr.addEventListener('change',function(ev){if(ev.target&&ev.target.name&&ev.target.name.indexOf('pin')===0)setRefreshPins();});");
   inner += F("var nd=document.getElementById('ip_mode_dhcp');var nm=document.getElementById('ip_mode_manual');if(nd)nd.addEventListener('change',function(){markNetDirty();applyNetModeUi();});if(nm)nm.addEventListener('change',function(){markNetDirty();applyNetModeUi();});");
   inner += F("var nii=document.getElementById('net_ip_in');var nim=document.getElementById('net_mask_in');if(nii)nii.addEventListener('input',markNetDirty);if(nim)nim.addEventListener('input',markNetDirty);");
   inner += F("var ns=document.getElementById('net_save_btn');if(ns)ns.addEventListener('click',function(ev){ev.preventDefault();saveNet();});");
-  inner += F("setRenumber();applyTestModeUi();refreshFirmwareRelease();refreshCompanionRelease();}catch(e){}})();");
+  inner += F("setRenumber();applyTestModeUi();pollOtaStatus();refreshCompanionRelease();}catch(e){}})();");
   inner += F("(function(){");
   inner += F("var dnBtn=document.getElementById('dn-btn'),dnForm=document.getElementById('dn-form'),dnInp=document.getElementById('dn-inp'),dnDisp=document.getElementById('dn-disp');");
   inner += F("function openDn(){var cur=dnDisp?dnDisp.textContent.replace(/^\\s*\\[\\s*/,'').replace(/\\s*\\]\\s*$/,'').trim():'';dnInp.value=cur;dnForm.style.display='block';dnInp.focus();dnInp.select();}");
@@ -1531,6 +1935,35 @@ static void appendJsonQuoted(String &dst, const String &s) {
   dst += '"';
 }
 
+static void appendOtaSnapshotJson(String &j, const OtaRuntimeState &snapshot) {
+  j += F(",\"busy\":");
+  j += snapshot.busy ? '1' : '0';
+  j += F(",\"busy_source\":");
+  j += String(snapshot.source);
+  j += F(",\"update_available\":");
+  j += snapshot.updateAvailable ? '1' : '0';
+  j += F(",\"asset_matched\":");
+  j += snapshot.assetMatched ? '1' : '0';
+  j += F(",\"reboot_pending\":");
+  j += snapshot.rebootPending ? '1' : '0';
+  j += F(",\"progress_pct\":");
+  j += String(snapshot.progressPct);
+  j += F(",\"bytes_done\":");
+  j += String(snapshot.bytesDone);
+  j += F(",\"total_bytes\":");
+  j += String(snapshot.totalBytes);
+  j += F(",\"status_code\":");
+  j += String(snapshot.httpStatus);
+  j += F(",\"latest_version\":");
+  appendJsonQuoted(j, String(snapshot.latestVersion));
+  j += F(",\"asset_name\":");
+  appendJsonQuoted(j, String(snapshot.assetName));
+  j += F(",\"phase\":");
+  appendJsonQuoted(j, String(snapshot.phase));
+  j += F(",\"message\":");
+  appendJsonQuoted(j, String(snapshot.message));
+}
+
 static void sendGpioDashboardJson(const char *changedLiteralOrNull) {
   const uint32_t sig = dashboardStateSig();
   const int chCount = gpioRuntimeChannelCount();
@@ -1673,6 +2106,104 @@ void handleUpdateInfo() {
   j += '}';
   g_server.sendHeader(F("Cache-Control"), F("no-store"));
   g_server.send(200, F("application/json"), j);
+}
+
+void handleOtaStatus() {
+  if (kRequireWebLogin && !cookieMatchesSession()) {
+    g_server.send(401, F("application/json"), F("{\"ok\":false,\"err\":\"unauthorized\"}"));
+    return;
+  }
+  const OtaRuntimeState snapshot = otaSnapshot();
+  String j;
+  j.reserve(512);
+  j += F("{\"ok\":true,\"installed_version\":");
+  appendJsonQuoted(j, String(kFirmwareVersion));
+  appendOtaSnapshotJson(j, snapshot);
+  j += '}';
+  g_server.sendHeader(F("Cache-Control"), F("no-store"));
+  g_server.send(200, F("application/json"), j);
+}
+
+void handleOtaCheck() {
+  if (kRequireWebLogin && !cookieMatchesSession()) {
+    g_server.send(401, F("application/json"), F("{\"ok\":false,\"err\":\"unauthorized\"}"));
+    return;
+  }
+  if (!otaHasNetworkUplink()) {
+    g_server.send(503, F("application/json"),
+                  F("{\"ok\":false,\"err\":\"network_unavailable\",\"message\":\"No Wi-Fi or Ethernet uplink is active.\"}"));
+    return;
+  }
+
+  GithubReleaseInfo release;
+  if (!resolveLatestGithubRelease(String(kFirmwareReleaseRepo), String(kFirmwareAssetSuffix), false, release)) {
+    if (release.statusCode == 404) {
+      otaRememberRelease(String(), String(), false, false, release.statusCode);
+      g_server.sendHeader(F("Cache-Control"), F("no-store"));
+      g_server.send(200, F("application/json"),
+                    String(F("{\"ok\":true,\"installed_version\":\"")) + kFirmwareVersion +
+                        F("\",\"release_found\":false,\"newer_release\":false,\"update_available\":false,"
+                          "\"asset_matched\":false,\"latest_version\":\"\",\"asset_name\":\"\"}"));
+      return;
+    }
+    g_server.sendHeader(F("Cache-Control"), F("no-store"));
+    g_server.send(502, F("application/json"),
+                  String(F("{\"ok\":false,\"err\":\"github_unreachable\",\"status_code\":")) +
+                      String(release.statusCode) +
+                      F(",\"message\":\"Could not query GitHub for the latest firmware release.\"}"));
+    return;
+  }
+
+  const bool newerRelease = compareVersionStrings(release.latestVersion, String(kFirmwareVersion)) > 0;
+  const bool updateAvailable = newerRelease && release.assetMatched;
+  otaRememberRelease(release.latestVersion, release.assetName, updateAvailable, release.assetMatched, release.statusCode);
+
+  String j;
+  j.reserve(512);
+  j += F("{\"ok\":true,\"installed_version\":");
+  appendJsonQuoted(j, String(kFirmwareVersion));
+  j += F(",\"release_found\":true,\"newer_release\":");
+  j += newerRelease ? '1' : '0';
+  j += F(",\"update_available\":");
+  j += updateAvailable ? '1' : '0';
+  j += F(",\"asset_matched\":");
+  j += release.assetMatched ? '1' : '0';
+  j += F(",\"latest_version\":");
+  appendJsonQuoted(j, release.latestVersion);
+  j += F(",\"asset_name\":");
+  appendJsonQuoted(j, release.assetName);
+  j += F(",\"target\":");
+  appendJsonQuoted(j, String(kFirmwareTargetId));
+  j += F(",\"asset_suffix\":");
+  appendJsonQuoted(j, String(kFirmwareAssetSuffix));
+  j += '}';
+  g_server.sendHeader(F("Cache-Control"), F("no-store"));
+  g_server.send(200, F("application/json"), j);
+}
+
+void handleOtaStart() {
+  if (kRequireWebLogin && !cookieMatchesSession()) {
+    g_server.send(401, F("application/json"), F("{\"ok\":false,\"err\":\"unauthorized\"}"));
+    return;
+  }
+  if (!otaHasNetworkUplink()) {
+    g_server.send(503, F("application/json"),
+                  F("{\"ok\":false,\"err\":\"network_unavailable\",\"message\":\"No Wi-Fi or Ethernet uplink is active.\"}"));
+    return;
+  }
+  if (!otaTryBegin(kOtaSourceDevice, "check", "Checking latest firmware release...")) {
+    g_server.send(409, F("application/json"),
+                  F("{\"ok\":false,\"err\":\"busy\",\"message\":\"Another OTA operation is already running.\"}"));
+    return;
+  }
+  if (xTaskCreate(otaDeviceUpdateTask, "ota-device", 16384, nullptr, 1, &g_otaDownloadTaskHandle) != pdPASS) {
+    otaFinishError(kOtaSourceDevice, 0, "Could not start the OTA background task.");
+    g_server.send(500, F("application/json"),
+                  F("{\"ok\":false,\"err\":\"task_create_failed\",\"message\":\"Could not start the OTA task.\"}"));
+    return;
+  }
+  g_server.sendHeader(F("Cache-Control"), F("no-store"));
+  g_server.send(200, F("application/json"), F("{\"ok\":true,\"started\":true}"));
 }
 
 void handleNetworkConfigPost() {
@@ -2001,17 +2532,42 @@ void handleDeviceNamePost() {
 void handleOtaChunk() {
   HTTPUpload &upload = g_server.upload();
   if (upload.status == UPLOAD_FILE_START) {
+    g_manualOtaAccepted = otaTryBegin(kOtaSourceManual, "upload", "Receiving manual OTA upload...");
+    if (!g_manualOtaAccepted) {
+      Serial.println(F("[OTA] Manual upload rejected because another OTA operation is active."));
+      return;
+    }
     Serial.printf("[OTA] Start: %s\n", upload.filename.c_str());
-    if (!Update.begin(UPDATE_SIZE_UNKNOWN))
+    otaSetProgress(kOtaSourceManual, "upload", "Receiving manual OTA upload...", 0, 0, 0);
+    if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
       Serial.printf("[OTA] begin error: %s\n", Update.errorString());
+      otaFinishError(kOtaSourceManual, 0, Update.errorString());
+      g_manualOtaAccepted = false;
+    }
+  } else if (!g_manualOtaAccepted) {
+    return;
   } else if (upload.status == UPLOAD_FILE_WRITE) {
-    if (Update.write(upload.buf, upload.currentSize) != upload.currentSize)
+    if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
       Serial.printf("[OTA] write error: %s\n", Update.errorString());
+      otaFinishError(kOtaSourceManual, 0, Update.errorString());
+      g_manualOtaAccepted = false;
+      return;
+    }
+    otaSetProgress(kOtaSourceManual, "upload", "Receiving manual OTA upload...", 0, upload.totalSize, 0);
   } else if (upload.status == UPLOAD_FILE_END) {
-    if (Update.end(true))
+    if (Update.end(true)) {
       Serial.printf("[OTA] Complete: %u bytes\n", upload.totalSize);
-    else
+      otaSetProgress(kOtaSourceManual, "upload", "Manual OTA upload complete. Finalizing firmware...", 100, upload.totalSize,
+                     upload.totalSize);
+    } else {
       Serial.printf("[OTA] end error: %s\n", Update.errorString());
+      otaFinishError(kOtaSourceManual, 0, Update.errorString());
+      g_manualOtaAccepted = false;
+    }
+  } else if (upload.status == UPLOAD_FILE_ABORTED) {
+    Update.abort();
+    otaFinishError(kOtaSourceManual, 0, "Manual OTA upload was aborted.");
+    g_manualOtaAccepted = false;
   }
 }
 
@@ -2020,13 +2576,34 @@ void handleOtaComplete() {
     g_server.send(401, F("application/json"), F("{\"ok\":false,\"err\":\"unauthorized\"}"));
     return;
   }
+  if (!g_manualOtaAccepted) {
+    const OtaRuntimeState snapshot = otaSnapshot();
+    if (snapshot.busy && snapshot.source == kOtaSourceDevice) {
+      g_server.send(409, F("application/json"),
+                    F("{\"ok\":false,\"err\":\"busy\",\"message\":\"Another OTA operation is already running.\"}"));
+      return;
+    }
+    if (String(snapshot.phase) == F("error")) {
+      String j;
+      j.reserve(256);
+      j += F("{\"ok\":false,\"err\":");
+      appendJsonQuoted(j, String(snapshot.message));
+      j += '}';
+      g_server.send(500, F("application/json"), j);
+      return;
+    }
+    g_server.send(400, F("application/json"), F("{\"ok\":false,\"err\":\"no_upload\"}"));
+    return;
+  }
+
+  g_manualOtaAccepted = false;
   if (Update.hasError()) {
+    otaFinishError(kOtaSourceManual, 0, Update.errorString());
     g_server.send(500, F("application/json"),
                   String(F("{\"ok\":false,\"err\":\"")) + Update.errorString() + F("\"}"));
   } else {
+    otaScheduleReboot("Manual OTA upload installed successfully. Rebooting device...");
     g_server.send(200, F("application/json"), F("{\"ok\":true}"));
-    delay(400);
-    ESP.restart();
   }
 }
 
@@ -2190,6 +2767,9 @@ void registerHandlers() {
   g_server.on(F("/api/companion/gpo/set"), HTTP_POST, handleApiCompanionGpoSet);
   g_server.on(F("/api/companion/gpo/set/bulk"), HTTP_POST, handleApiCompanionGpoBulkSet);
   g_server.on(F("/api/companion/module/download"), HTTP_GET, handleApiCompanionModuleDownload);
+  g_server.on(F("/api/ota/check"), HTTP_POST, handleOtaCheck);
+  g_server.on(F("/api/ota/status"), HTTP_GET, handleOtaStatus);
+  g_server.on(F("/api/ota/start"), HTTP_POST, handleOtaStart);
   g_server.on(F("/api/ota/download"), HTTP_GET, handleApiFirmwareDownload);
   g_server.on(F("/api/gpio/hold"), HTTP_POST, handleGpioHoldPost);
   g_server.on(F("/api/gpio/invert"), HTTP_POST, handleGpioInvertPost);
@@ -2288,6 +2868,7 @@ void setup() {
   (void)digitalRead(PIN_FORCE_CONFIG);
   (void)detectDoubleReset();
 
+  otaResetRuntimeState();
   registerHandlers();
   if (!startSoftApPortal())
     Serial.println(F("softAP failed"));
@@ -2303,6 +2884,10 @@ void setup() {
 void loop() {
   oledStatusLoop();
   atemServiceLoop();
+  if (otaRebootDue()) {
+    delay(50);
+    ESP.restart();
+  }
   startMdnsIfReady();
   if (g_apMode) {
     g_dns.processNextRequest();
