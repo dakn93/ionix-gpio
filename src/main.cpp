@@ -24,7 +24,7 @@
 #include <pins.h>
 
 #ifndef IONIX_FW_VERSION
-#define IONIX_FW_VERSION "0.1.2"
+#define IONIX_FW_VERSION "0.1.3"
 #endif
 
 namespace {
@@ -277,6 +277,15 @@ void loadUserChannelsFromNvs() {
     g_userChannels[i].isGpo = g_prefs.getBool(tk, defaultChannelIsGpoForIndex(i));
     g_userChannels[i].pin = g_prefs.getInt(pk, defaultChannelPinForIndex(i));
   }
+}
+
+int collectUserChannelPins(int *pins, int maxPins) {
+  if (!pins || maxPins <= 0)
+    return 0;
+  int count = 0;
+  for (int i = 0; i < g_userChannelCount && count < maxPins; i++)
+    pins[count++] = g_userChannels[i].pin;
+  return count;
 }
 
 void saveUserChannelsToNvs() {
@@ -2859,6 +2868,9 @@ void setup() {
 #endif
   gpioLogicBegin(g_prefs);
   loadUserChannelsFromNvs();
+  int oledBlockedPins[kMaxUserChannels];
+  const int oledBlockedPinCount = collectUserChannelPins(oledBlockedPins, kMaxUserChannels);
+  oledStatusBegin(oledBlockedPins, oledBlockedPinCount);
   applyUserChannelsToRuntime();
   atemServiceBegin(g_prefs);
   gpioApplyOutputs();
@@ -2874,7 +2886,6 @@ void setup() {
     Serial.println(F("softAP failed"));
 
   g_server.begin();
-  oledStatusBegin();
   oledStatusSetReady(true);
   Serial.println(F("SoftAP always on; STA if configured"));
   Serial.println(apSsid());

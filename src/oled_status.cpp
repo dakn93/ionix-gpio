@@ -46,6 +46,16 @@ static bool isAddrPresent(uint8_t addr) {
   return Wire.endTransmission() == 0;
 }
 
+static bool isBlockedPin(int pin, const int *blockedPins, int blockedPinCount) {
+  if (!blockedPins || blockedPinCount <= 0)
+    return false;
+  for (int i = 0; i < blockedPinCount; i++) {
+    if (blockedPins[i] == pin)
+      return true;
+  }
+  return false;
+}
+
 #if defined(CONFIG_IDF_TARGET_ESP32P4)
 static void logI2cQuickScan() {
   Serial.print(F("[OLED]   bus scan:"));
@@ -126,11 +136,21 @@ static String hotspotPassword() { return String(F("ionixpass")); }
 
 } // namespace
 
-void oledStatusBegin() {
+void oledStatusBegin(const int *blockedPins, int blockedPinCount) {
   bool found = false;
   for (unsigned pi = 0; pi < sizeof(kPinCandidates) / sizeof(kPinCandidates[0]) && !found; pi++) {
     const int sda = kPinCandidates[pi].sda;
     const int scl = kPinCandidates[pi].scl;
+    if (isBlockedPin(sda, blockedPins, blockedPinCount) || isBlockedPin(scl, blockedPins, blockedPinCount)) {
+#if defined(CONFIG_IDF_TARGET_ESP32P4)
+      Serial.print(F("[OLED] skip SDA=GPIO"));
+      Serial.print(sda);
+      Serial.print(F(" SCL=GPIO"));
+      Serial.print(scl);
+      Serial.println(F(" (reserved by GPIO config)."));
+#endif
+      continue;
+    }
     Wire.begin(sda, scl);
     Wire.setClock(100000); // 100 kHz — more tolerant with dupont wiring than default 400 kHz+
 #if defined(CONFIG_IDF_TARGET_ESP32P4)
